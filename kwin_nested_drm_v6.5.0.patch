@@ -1,0 +1,424 @@
+diff --git a/src/backends/drm/drm_backend.cpp b/src/backends/drm/drm_backend.cpp
+index 54dd76bbdf..dcd8b63852 100644
+--- a/src/backends/drm/drm_backend.cpp
++++ b/src/backends/drm/drm_backend.cpp
+@@ -35,6 +35,7 @@
+ // system
+ #include <algorithm>
+ #include <cerrno>
++#include <fcntl.h>
+ #include <ranges>
+ #include <sys/stat.h>
+ #include <unistd.h>
+@@ -208,7 +209,8 @@ void DrmBackend::handleUdevEvent()
+ 
+ DrmGpu *DrmBackend::addGpu(const QString &fileName)
+ {
+-    int fd = m_session->openRestricted(fileName);
++    int fd = open(fileName.toStdString().c_str(), 0);
++    fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+     if (fd < 0) {
+         qCWarning(KWIN_DRM) << "failed to open drm device at" << fileName;
+         return nullptr;
+diff --git a/src/backends/drm/drm_backend.h b/src/backends/drm/drm_backend.h
+index d4654a593f..f2b6299bcf 100644
+--- a/src/backends/drm/drm_backend.h
++++ b/src/backends/drm/drm_backend.h
+@@ -49,6 +49,11 @@ public:
+     Outputs outputs() const override;
+     Session *session() const override;
+ 
++    void setSession(KWin::Session *sess)
++    {
++        m_session = sess;
++    }
++
+     QList<CompositingType> supportedCompositors() const override;
+ 
+     QString supportInformation() const override;
+diff --git a/src/backends/wayland/wayland_backend.cpp b/src/backends/wayland/wayland_backend.cpp
+index a46ade8c4e..87b91a0851 100644
+--- a/src/backends/wayland/wayland_backend.cpp
++++ b/src/backends/wayland/wayland_backend.cpp
+@@ -63,9 +63,8 @@ WaylandInputDevice::WaylandInputDevice(KWayland::Client::Keyboard *keyboard, Way
+         KeyboardKeyState state;
+         switch (nativeState) {
+         case Keyboard::KeyState::Pressed:
+-            if (key == KEY_RIGHTCTRL) {
+-                m_seat->backend()->togglePointerLock();
+-            }
++            // Always toggle (turn on) pointer lock
++            m_seat->backend()->togglePointerLock();
+             state = KeyboardKeyState::Pressed;
+             m_pressedKeys.insert(key);
+             break;
+@@ -177,8 +176,19 @@ WaylandInputDevice::WaylandInputDevice(KWayland::Client::RelativePointer *relati
+     : m_seat(seat)
+     , m_relativePointer(relativePointer)
+ {
++    static double pointbufferx = 0;
++    static double pointbuffery = 0;
++    // removed pointer accel here, to make games not change sens based on raw input (ATTENTION: WINE/Proton DOES ONLY int-value ptr movements, therefore the smoothing shenanigans)
+     connect(relativePointer, &RelativePointer::relativeMotion, this, [this](const QSizeF &delta, const QSizeF &deltaNonAccelerated, quint64 timestamp) {
+-        Q_EMIT pointerMotion(sizeToPoint(delta), sizeToPoint(deltaNonAccelerated), std::chrono::microseconds(timestamp), this);
++        double scaledx = delta.width();
++        double scaledy = delta.height();
++        pointbufferx += scaledx - static_cast<int>(scaledx);
++        pointbuffery += scaledy - static_cast<int>(scaledy);
++
++        Q_EMIT pointerMotion(sizeToPoint(delta), sizeToPoint(QSizeF(static_cast<int>(scaledx) + static_cast<int>(pointbufferx), static_cast<int>(scaledy) + static_cast<int>(pointbuffery))), std::chrono::microseconds(timestamp), this);
++
++        pointbufferx -= static_cast<int>(pointbufferx);
++        pointbuffery -= static_cast<int>(pointbuffery);
+     });
+ }
+ 
+@@ -309,7 +319,7 @@ WaylandSeat::WaylandSeat(KWayland::Client::Seat *nativeSeat, WaylandBackend *bac
+     , m_seat(nativeSeat)
+     , m_backend(backend)
+ {
+-    auto updateKeyboardDevice = [this](){
++    auto updateKeyboardDevice = [this]() {
+         if (m_seat->hasKeyboard()) {
+             createKeyboardDevice();
+         } else {
+@@ -515,7 +525,10 @@ std::unique_ptr<QPainterBackend> WaylandBackend::createQPainterBackend()
+ WaylandOutput *WaylandBackend::findOutput(KWayland::Client::Surface *nativeSurface) const
+ {
+     for (WaylandOutput *output : m_outputs) {
+-        const auto layers = Compositor::self()->backend()->compatibleOutputLayers(output);
++        if (!dynamic_cast<WaylandOutput *>(output)) {
++            continue;
++        }
++        const auto layers = Compositor::self()->backend2()->compatibleOutputLayers(output);
+         const bool isALayer = std::ranges::any_of(layers, [nativeSurface](OutputLayer *layer) {
+             if (layer->type() == OutputLayerType::CursorOnly) {
+                 return false;
+@@ -535,7 +548,7 @@ WaylandOutput *WaylandBackend::findOutput(KWayland::Client::Surface *nativeSurfa
+ KWayland::Client::SubSurface *WaylandBackend::findSubSurface(KWayland::Client::Surface *nativeSurface) const
+ {
+     for (WaylandOutput *output : m_outputs) {
+-        const auto layers = Compositor::self()->backend()->compatibleOutputLayers(output);
++        const auto layers = Compositor::self()->backend2()->compatibleOutputLayers(output);
+         const auto it = std::ranges::find_if(layers, [nativeSurface](OutputLayer *layer) {
+             // cursor-only layers are a different class
+             // and can't be a subsurface
+@@ -576,9 +589,9 @@ void WaylandBackend::togglePointerLock()
+     }
+ 
+     for (auto output : std::as_const(m_outputs)) {
+-        output->lockPointer(m_seat->pointerDevice()->nativePointer(), !m_pointerLockRequested);
++        output->lockPointer(m_seat->pointerDevice()->nativePointer(), true);
+     }
+-    m_pointerLockRequested = !m_pointerLockRequested;
++    // Always lock no unlock
+ }
+ 
+ QList<CompositingType> WaylandBackend::supportedCompositors() const
+@@ -678,9 +691,9 @@ wl_buffer *WaylandBackend::importBuffer(GraphicsBuffer *graphicsBuffer)
+ 
+         static const wl_buffer_listener listener = {
+             .release = [](void *userData, wl_buffer *buffer) {
+-                WaylandBuffer *slot = static_cast<WaylandBuffer *>(userData);
+-                slot->unlock();
+-            },
++            WaylandBuffer *slot = static_cast<WaylandBuffer *>(userData);
++            slot->unlock();
++        },
+         };
+         wl_buffer_add_listener(handle, &listener, buffer.get());
+     }
+diff --git a/src/backends/wayland/wayland_output.cpp b/src/backends/wayland/wayland_output.cpp
+index 1481038a16..3d204d4def 100644
+--- a/src/backends/wayland/wayland_output.cpp
++++ b/src/backends/wayland/wayland_output.cpp
+@@ -488,6 +488,10 @@ void WaylandOutput::lockPointer(Pointer *pointer, bool lock)
+         }
+         return;
+     }
++    if (m_pointerLock) {
++        // Already locked from autolock
++        return;
++    }
+ 
+     Q_ASSERT(!m_pointerLock);
+     m_pointerLock.reset(m_backend->display()->pointerConstraints()->lockPointer(surface(), pointer, nullptr, PointerConstraints::LifeTime::OneShot));
+diff --git a/src/compositor.cpp b/src/compositor.cpp
+index aeaa6651c7..6cfd585127 100644
+--- a/src/compositor.cpp
++++ b/src/compositor.cpp
+@@ -48,6 +48,9 @@
+ #include <optional>
+ #include <ranges>
+ 
++#include "backends/drm/drm_output.h"
++#include "backends/wayland/wayland_output.h"
++
+ namespace KWin
+ {
+ 
+@@ -238,6 +241,11 @@ void Compositor::start()
+     if (kwinApp()->isTerminating()) {
+         return;
+     }
++    // DIY QPAINTER-WAYLAND INITILIZER
++    {
++        std::unique_ptr<QPainterBackend> backend(kwinApp()->outputBackend2()->createQPainterBackend());
++        m_backend2 = std::move(backend);
++    }
+     if (m_state != State::Off) {
+         return;
+     }
+@@ -279,6 +287,7 @@ void Compositor::start()
+     for (Output *output : outputs) {
+         addOutput(output);
+     }
++    addOutput(kwinApp()->outputBackend2()->outputs()[0]);
+     connect(workspace(), &Workspace::outputAdded, this, &Compositor::addOutput);
+     connect(workspace(), &Workspace::outputRemoved, this, &Compositor::removeOutput);
+ 
+@@ -934,11 +943,44 @@ void Compositor::composite(RenderLoop *renderLoop)
+     }
+ }
+ 
++void Compositor::drawonce_function(Output *output)
++{
++    const auto layers = m_backend2->compatibleOutputLayers(output);
++    const auto primaryLayer = findLayer(layers, OutputLayerType::Primary, std::nullopt);
++    Q_ASSERT(primaryLayer);
++    auto &sceneView = m_primaryViews[output->renderLoop()];
++    if (sceneView) {
++        sceneView->setLayer(primaryLayer);
++    } else {
++        sceneView = std::make_unique<SceneView>(m_scene.get(), output, primaryLayer);
++        sceneView->setViewport(output->geometryF());
++        sceneView->setScale(output->scale());
++        connect(output, &Output::geometryChanged, sceneView.get(), [output, view = sceneView.get()]() {
++            view->setViewport(output->geometryF());
++        });
++        connect(output, &Output::scaleChanged, sceneView.get(), [output, view = sceneView.get()]() {
++            view->setScale(output->scale());
++        });
++    }
++
++    QList<OutputLayer *> toUpdate;
++
++    auto renderLoop = output->renderLoop();
++    renderLoop->prepareNewFrame();
++    renderLoop->newFramePrepared();
++    auto frame = std::make_shared<OutputFrame>(renderLoop, std::chrono::nanoseconds(1'000'000'000'000 / 60));
++    output->present(toUpdate, frame);
++}
++
+ void Compositor::addOutput(Output *output)
+ {
+     if (output->isPlaceholder()) {
+         return;
+     }
++    if (!dynamic_cast<KWin::DrmOutput *>(output)) {
++        drawonce_function(output);
++        return;
++    }
+     assignOutputLayers(output);
+     connect(output->renderLoop(), &RenderLoop::frameRequested, this, &Compositor::handleFrameRequested);
+     connect(output, &Output::outputLayersChanged, this, [this, output]() {
+diff --git a/src/compositor.h b/src/compositor.h
+index 87fee7bfa0..0403a8c357 100644
+--- a/src/compositor.h
++++ b/src/compositor.h
+@@ -73,6 +73,10 @@ public:
+     {
+         return m_backend.get();
+     }
++    RenderBackend *backend2() const
++    {
++        return m_backend2.get();
++    }
+ 
+     void createRenderer();
+ 
+@@ -102,12 +106,14 @@ protected:
+     void addOutput(Output *output);
+     void removeOutput(Output *output);
+     void assignOutputLayers(Output *output);
++    void drawonce_function(Output *output);
+ 
+     CompositingType m_selectedCompositor = NoCompositing;
+ 
+     State m_state = State::Off;
+     std::unique_ptr<WorkspaceScene> m_scene;
+     std::unique_ptr<RenderBackend> m_backend;
++    std::unique_ptr<RenderBackend> m_backend2;
+     std::unordered_map<RenderLoop *, std::unique_ptr<SceneView>> m_primaryViews;
+     std::unordered_map<RenderLoop *, std::unordered_map<OutputLayer *, std::unique_ptr<ItemView>>> m_overlayViews;
+     std::unordered_set<RenderLoop *> m_brokenCursors;
+diff --git a/src/core/renderloop.cpp b/src/core/renderloop.cpp
+index 6f7d564f48..19421667b0 100644
+--- a/src/core/renderloop.cpp
++++ b/src/core/renderloop.cpp
+@@ -5,6 +5,7 @@
+ */
+ 
+ #include "renderloop.h"
++#include "backends/drm/drm_output.h"
+ #include "options.h"
+ #include "renderloop_p.h"
+ #include "scene/surfaceitem.h"
+@@ -43,72 +44,8 @@ void RenderLoopPrivate::scheduleNextRepaint()
+ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimestamp)
+ {
+     pendingReschedule = false;
+-    const std::chrono::nanoseconds vblankInterval(1'000'000'000'000ull / refreshRate);
+-    const std::chrono::nanoseconds currentTime(std::chrono::steady_clock::now().time_since_epoch());
+-
+-    // Estimate when it's a good time to perform the next compositing cycle.
+-    // the 1ms on top of the safety margin is required for timer and scheduler inaccuracies
+-    std::chrono::nanoseconds expectedCompositingTime = std::min(renderJournal.result() + safetyMargin + 1ms, 2 * vblankInterval);
+-
+-    if (presentationMode == PresentationMode::VSync) {
+-        // normal presentation: pageflips only happen at vblank
+-        const uint64_t pageflipsSince = std::max<int64_t>((currentTime - lastPresentationTimestamp) / vblankInterval, 0);
+-        if (pageflipsSince > 100) {
+-            // if it's been a while since the last frame, the GPU is likely in a low power state and render time will be increased
+-            // -> take that into account and start compositing very early
+-            expectedCompositingTime = std::max(vblankInterval - 1us, expectedCompositingTime);
+-        }
+-        const uint64_t pageflipsSinceLastToTarget = std::max<int64_t>(std::round((lastTargetTimestamp - lastPresentationTimestamp).count() / double(vblankInterval.count())), 0);
+-        uint64_t pageflipsInAdvance = std::min<int64_t>(expectedCompositingTime / vblankInterval + 1, maxPendingFrameCount);
+-
+-        // switching from double to triple buffering causes a frame drop
+-        // -> apply some amount of hysteresis to avoid switching back and forth constantly
+-        if (pageflipsInAdvance > 1) {
+-            // immediately switch to triple buffering when needed
+-            wasTripleBuffering = true;
+-            doubleBufferingCounter = 0;
+-        } else if (wasTripleBuffering) {
+-            // but wait a bit before switching back to double buffering
+-            if (doubleBufferingCounter >= 10) {
+-                wasTripleBuffering = false;
+-            } else if (expectedCompositingTime >= vblankInterval * 0.95) {
+-                // also don't switch back if render times are just barely enough for double buffering
+-                pageflipsInAdvance = 2;
+-                doubleBufferingCounter = 0;
+-                expectedCompositingTime = vblankInterval;
+-            } else {
+-                doubleBufferingCounter++;
+-                pageflipsInAdvance = 2;
+-                expectedCompositingTime = vblankInterval;
+-            }
+-        }
+-
+-        if (compositeTimer.isActive()) {
+-            // we already scheduled this frame, but we got a new timestamp
+-            // which might require starting to composite earlier than we planned
+-            // It's important here that we do not change the targeted vblank interval,
+-            // otherwise with a pessimistic compositing time estimation we might
+-            // unnecessarily drop frames
+-            const uint32_t intervalsSinceLastTimestamp = std::max<int32_t>(std::round((nextPresentationTimestamp - lastPresentationTimestamp).count() / double(vblankInterval.count())), 0);
+-            nextPresentationTimestamp = lastPresentationTimestamp + intervalsSinceLastTimestamp * vblankInterval;
+-        } else {
+-            nextPresentationTimestamp = lastPresentationTimestamp + std::max(pageflipsSince + pageflipsInAdvance, pageflipsSinceLastToTarget + 1) * vblankInterval;
+-        }
+-    } else {
+-        wasTripleBuffering = false;
+-        doubleBufferingCounter = 0;
+-        if (presentationMode == PresentationMode::Async || presentationMode == PresentationMode::AdaptiveAsync) {
+-            // tearing: pageflips happen ASAP
+-            nextPresentationTimestamp = currentTime;
+-        } else {
+-            // adaptive sync: pageflips happen after one vblank interval
+-            // TODO read minimum refresh rate from the EDID and take it into account here
+-            nextPresentationTimestamp = std::max(currentTime, lastPresentationTimestamp + vblankInterval);
+-        }
+-    }
+-
+-    const std::chrono::nanoseconds nextRenderTimestamp = nextPresentationTimestamp - expectedCompositingTime;
+-    compositeTimer.start(std::max(0ms, std::chrono::duration_cast<std::chrono::milliseconds>(nextRenderTimestamp - currentTime)), Qt::PreciseTimer, q);
++    nextPresentationTimestamp = std::chrono::steady_clock::now().time_since_epoch();
++    compositeTimer.start(2ms, Qt::PreciseTimer, q);
+ }
+ 
+ void RenderLoopPrivate::delayScheduleRepaint()
+diff --git a/src/main.cpp b/src/main.cpp
+index bb58445e2b..d15607a825 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -595,7 +595,7 @@ void Application::setProcessStartupEnvironment(const QProcessEnvironment &enviro
+ 
+ void Application::setOutputBackend(std::unique_ptr<OutputBackend> &&backend)
+ {
+-    Q_ASSERT(!m_outputBackend);
++    m_outputBackend2 = std::move(m_outputBackend);
+     m_outputBackend = std::move(backend);
+ }
+ 
+diff --git a/src/main.h b/src/main.h
+index c87744547c..71ea660a28 100644
+--- a/src/main.h
++++ b/src/main.h
+@@ -224,6 +224,10 @@ public:
+     {
+         return m_outputBackend.get();
+     }
++    OutputBackend *outputBackend2() const
++    {
++        return m_outputBackend2.get();
++    }
+     void setOutputBackend(std::unique_ptr<OutputBackend> &&backend);
+ 
+     Session *session() const
+@@ -375,6 +379,7 @@ private:
+ #endif
+     std::unique_ptr<Session> m_session;
+     std::unique_ptr<OutputBackend> m_outputBackend;
++    std::unique_ptr<OutputBackend> m_outputBackend2;
+     bool m_terminating = false;
+     qreal m_xwaylandScale = 1;
+     QProcessEnvironment m_processEnvironment;
+diff --git a/src/main_wayland.cpp b/src/main_wayland.cpp
+index a92a3de72e..e2f4db0509 100644
+--- a/src/main_wayland.cpp
++++ b/src/main_wayland.cpp
+@@ -54,6 +54,9 @@
+ #include <iomanip>
+ #include <iostream>
+ 
++#include "backends/drm/drm_abstract_output.h"
++#include "backends/wayland/wayland_qpainter_backend.h"
++
+ Q_IMPORT_PLUGIN(KWinIntegrationPlugin)
+ #if KWIN_BUILD_GLOBALSHORTCUTS
+ Q_IMPORT_PLUGIN(KGlobalAccelImpl)
+@@ -129,18 +132,29 @@ ApplicationWayland::~ApplicationWayland()
+     delete WaylandServer::self();
+ }
+ 
++static KWin::Wayland::WaylandBackend staticwayland = KWin::Wayland::WaylandBackend(KWin::Wayland::WaylandBackendOptions{
++    .socketName = "wayland-0",
++    .outputCount = 1,
++    .outputScale = 1,
++    .outputSize = QSize(256, 256),
++});
++static KWin::DrmBackend staticdrm = KWin::DrmBackend(KWin::Session::create(KWin::Session::Type::Noop).get());
++
+ void ApplicationWayland::performStartup()
+ {
+     createOptions();
+ 
+-    if (!outputBackend()->initialize()) {
+-        std::exit(1);
+-    }
++    staticwayland.initialize();
++    staticdrm.setSession(this->session());
++    staticdrm.initialize();
++    this->setOutputBackend(std::unique_ptr<KWin::Wayland::WaylandBackend>(&staticwayland));
+ 
+     createInput();
+     createInputMethod();
+     createTabletModeManager();
+ 
++    this->setOutputBackend(std::unique_ptr<KWin::DrmBackend>(&staticdrm));
++
+     auto compositor = Compositor::create();
+     compositor->createRenderer();
+     createWorkspace();
