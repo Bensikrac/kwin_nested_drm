@@ -1,0 +1,335 @@
+diff --git a/src/backends/drm/drm_backend.cpp b/src/backends/drm/drm_backend.cpp
+index 034b77b1d9..a6308c1571 100644
+--- a/src/backends/drm/drm_backend.cpp
++++ b/src/backends/drm/drm_backend.cpp
+@@ -36,6 +36,7 @@
+ // system
+ #include <algorithm>
+ #include <cerrno>
++#include <fcntl.h>
+ #include <ranges>
+ #include <sys/stat.h>
+ #include <thread>
+@@ -225,20 +226,13 @@ void DrmBackend::handleUdevEvent()
+ 
+ DrmGpu *DrmBackend::addGpu(const QString &fileName)
+ {
+-    std::expected<int, Session::Error> fd = m_session->openRestricted(fileName);
+-    QElapsedTimer timer;
+-    timer.start();
+-    // Switching between sessions / drm masters seems to be racy in some situations.
+-    // Lacking a proper solution for that, retry opening the node for up to 5s.
+-    while (!fd.has_value() && fd.error() == Session::Error::EBusy && timer.durationElapsed() < 5s) {
+-        qCDebug(KWIN_DRM, "Retrying openRestricted(%s)", qPrintable(fileName));
+-        std::this_thread::sleep_for(100ms);
+-        fd = m_session->openRestricted(fileName);
+-    }
+-    if (!fd.has_value()) {
+-        qCWarning(KWIN_DRM, "Failed to open drm device %s", qPrintable(fileName));
++    int fd2 = open(fileName.toStdString().c_str(), 0);
++    fd2 = fcntl(fd2, F_DUPFD_CLOEXEC, 0);
++    if (fd2 < 0) {
++        qCWarning(KWIN_DRM) << "failed to open drm device at" << fileName;
+         return nullptr;
+     }
++    int* fd = &fd2;
+ 
+     if (!drmIsKMS(*fd)) {
+         qCDebug(KWIN_DRM) << "Skipping KMS incapable drm device node at" << fileName;
+diff --git a/src/backends/drm/drm_backend.h b/src/backends/drm/drm_backend.h
+index 9ff048fe4f..4663ffa44a 100644
+--- a/src/backends/drm/drm_backend.h
++++ b/src/backends/drm/drm_backend.h
+@@ -49,6 +49,11 @@ public:
+     QList<BackendOutput *> outputs() const override;
+     Session *session() const override;
+ 
++    void setSession(KWin::Session *sess)
++    {
++        m_session = sess;
++    }
++
+     QList<CompositingType> supportedCompositors() const override;
+ 
+     QString supportInformation() const override;
+diff --git a/src/backends/wayland/wayland_backend.cpp b/src/backends/wayland/wayland_backend.cpp
+index 557156e92e..dd6e778c65 100644
+--- a/src/backends/wayland/wayland_backend.cpp
++++ b/src/backends/wayland/wayland_backend.cpp
+@@ -65,9 +65,8 @@ WaylandInputDevice::WaylandInputDevice(KWayland::Client::Keyboard *keyboard, Way
+         KeyboardKeyState state;
+         switch (nativeState) {
+         case Keyboard::KeyState::Pressed:
+-            if (key == KEY_RIGHTCTRL) {
+-                m_seat->backend()->togglePointerLock();
+-            }
++            // Always toggle (turn on) pointer lock
++            m_seat->backend()->togglePointerLock();
+             state = KeyboardKeyState::Pressed;
+             m_pressedKeys.insert(key);
+             break;
+@@ -179,8 +178,19 @@ WaylandInputDevice::WaylandInputDevice(KWayland::Client::RelativePointer *relati
+     : m_seat(seat)
+     , m_relativePointer(relativePointer)
+ {
++    static double pointbufferx = 0;
++    static double pointbuffery = 0;
++    // removed pointer accel here, to make games not change sens based on raw input (ATTENTION: WINE/Proton DOES ONLY int-value ptr movements, therefore the smoothing shenanigans)
+     connect(relativePointer, &RelativePointer::relativeMotion, this, [this](const QSizeF &delta, const QSizeF &deltaNonAccelerated, quint64 timestamp) {
+-        Q_EMIT pointerMotion(sizeToPoint(delta), sizeToPoint(deltaNonAccelerated), std::chrono::microseconds(timestamp), this);
++        double scaledx = delta.width();
++        double scaledy = delta.height();
++        pointbufferx += scaledx - static_cast<int>(scaledx);
++        pointbuffery += scaledy - static_cast<int>(scaledy);
++
++        Q_EMIT pointerMotion(sizeToPoint(delta), sizeToPoint(QSizeF(static_cast<int>(scaledx) + static_cast<int>(pointbufferx), static_cast<int>(scaledy) + static_cast<int>(pointbuffery))), std::chrono::microseconds(timestamp), this);
++
++        pointbufferx -= static_cast<int>(pointbufferx);
++        pointbuffery -= static_cast<int>(pointbuffery);
+     });
+ }
+
+@@ -517,7 +527,10 @@ std::unique_ptr<QPainterBackend> WaylandBackend::createQPainterBackend()
+ WaylandOutput *WaylandBackend::findOutput(KWayland::Client::Surface *nativeSurface) const
+ {
+     for (WaylandOutput *output : m_outputs) {
+-        const auto layers = Compositor::self()->backend()->compatibleOutputLayers(output);
++        if (!dynamic_cast<WaylandOutput *>(output)) {
++            continue;
++        }
++        const auto layers = Compositor::self()->backend2()->compatibleOutputLayers(output);
+         const bool isALayer = std::ranges::any_of(layers, [nativeSurface](OutputLayer *layer) {
+             if (layer->type() == OutputLayerType::CursorOnly) {
+                 return false;
+@@ -537,7 +550,7 @@ WaylandOutput *WaylandBackend::findOutput(KWayland::Client::Surface *nativeSurfa
+ KWayland::Client::SubSurface *WaylandBackend::findSubSurface(KWayland::Client::Surface *nativeSurface) const
+ {
+     for (WaylandOutput *output : m_outputs) {
+-        const auto layers = Compositor::self()->backend()->compatibleOutputLayers(output);
++        const auto layers = Compositor::self()->backend2()->compatibleOutputLayers(output);
+         const auto it = std::ranges::find_if(layers, [nativeSurface](OutputLayer *layer) {
+             // cursor-only layers are a different class
+             // and can't be a subsurface
+@@ -578,9 +591,9 @@ void WaylandBackend::togglePointerLock()
+     }
+ 
+     for (auto output : std::as_const(m_outputs)) {
+-        output->lockPointer(m_seat->pointerDevice()->nativePointer(), !m_pointerLockRequested);
++        output->lockPointer(m_seat->pointerDevice()->nativePointer(), true);
+     }
+-    m_pointerLockRequested = !m_pointerLockRequested;
++    // Always lock no unlock
+ }
+ 
+ QList<CompositingType> WaylandBackend::supportedCompositors() const
+@@ -661,9 +674,9 @@ wl_buffer *WaylandBackend::importBuffer(GraphicsBuffer *graphicsBuffer)
+ 
+         static const wl_buffer_listener listener = {
+             .release = [](void *userData, wl_buffer *buffer) {
+-                WaylandBuffer *slot = static_cast<WaylandBuffer *>(userData);
+-                slot->unlock();
+-            },
++            WaylandBuffer *slot = static_cast<WaylandBuffer *>(userData);
++            slot->unlock();
++        },
+         };
+         wl_buffer_add_listener(handle, &listener, buffer.get());
+     }
+diff --git a/src/backends/wayland/wayland_output.cpp b/src/backends/wayland/wayland_output.cpp
+index 7b1d1d6d19..77b582a1ff 100644
+--- a/src/backends/wayland/wayland_output.cpp
++++ b/src/backends/wayland/wayland_output.cpp
+@@ -509,6 +509,10 @@ void WaylandOutput::lockPointer(Pointer *pointer, bool lock)
+         }
+         return;
+     }
++    if (m_pointerLock) {
++        // Already locked from autolock
++        return;
++    }
+ 
+     Q_ASSERT(!m_pointerLock);
+     m_pointerLock.reset(m_backend->display()->pointerConstraints()->lockPointer(surface(), pointer, nullptr, PointerConstraints::LifeTime::OneShot));
+@@ -518,7 +522,7 @@ void WaylandOutput::lockPointer(Pointer *pointer, bool lock)
+     }
+     connect(m_pointerLock.get(), &LockedPointer::locked, this, [this]() {
+         m_hasPointerLock = true;
+-        inhibitShortcuts(true);
++        inhibitShortcuts(false);
+         updateWindowTitle();
+         Q_EMIT m_backend->pointerLockChanged(true);
+     });
+diff --git a/src/compositor.cpp b/src/compositor.cpp
+index 93dc8bedf1..b8cdb9334d 100644
+--- a/src/compositor.cpp
++++ b/src/compositor.cpp
+@@ -52,6 +52,9 @@
+ #include <optional>
+ #include <ranges>
+ 
++#include "backends/drm/drm_output.h"
++#include "backends/wayland/wayland_output.h"
++
+ namespace KWin
+ {
+ 
+@@ -254,6 +257,11 @@ void Compositor::start()
+     if (kwinApp()->isTerminating()) {
+         return;
+     }
++    // DIY QPAINTER-WAYLAND INITILIZER
++    {
++        std::unique_ptr<QPainterBackend> backend(kwinApp()->outputBackend2()->createQPainterBackend());
++        m_backend2 = std::move(backend);
++    }
+     if (m_state != State::Off) {
+         return;
+     }
+@@ -294,6 +302,7 @@ void Compositor::start()
+     handleOutputsChanged();
+     connect(workspace(), &Workspace::outputsChanged, this, &Compositor::handleOutputsChanged);
+     connect(kwinApp()->outputBackend(), &OutputBackend::outputRemoved, this, &Compositor::removeOutput);
++    addOutput(kwinApp()->outputBackend2()->outputs()[0]);
+ 
+     m_state = State::On;
+ 
+@@ -985,12 +994,26 @@ void Compositor::handleOutputsChanged()
+         addOutput(output);
+     }
+ }
++void Compositor::drawonce_function(BackendOutput *output)
++{
++    QList<OutputLayer *> toUpdate;
++
++    auto renderLoop = output->renderLoop();
++    renderLoop->prepareNewFrame();
++    renderLoop->newFramePrepared();
++    auto frame = std::make_shared<OutputFrame>(renderLoop, std::chrono::nanoseconds(1'000'000'000'000 / 60));
++    output->present(toUpdate, frame);
++}
+ 
+ void Compositor::addOutput(BackendOutput *output)
+ {
+     if (output->isPlaceholder()) {
+         return;
+     }
++    if (!dynamic_cast<KWin::DrmOutput *>(output)) {
++        drawonce_function(output);
++        return;
++    }
+     assignOutputLayers(output);
+     connect(output->renderLoop(), &RenderLoop::frameRequested, this, &Compositor::handleFrameRequested);
+ }
+diff --git a/src/compositor.h b/src/compositor.h
+index 1941cc0f31..c1a038fd66 100644
+--- a/src/compositor.h
++++ b/src/compositor.h
+@@ -74,6 +74,10 @@ public:
+     {
+         return m_backend.get();
+     }
++    RenderBackend *backend2() const
++    {
++        return m_backend2.get();
++    }
+ 
+     void createRenderer();
+ 
+@@ -104,12 +108,14 @@ protected:
+     void addOutput(BackendOutput *output);
+     void removeOutput(BackendOutput *output);
+     void assignOutputLayers(BackendOutput *output);
++    void drawonce_function(BackendOutput *output);
+ 
+     CompositingType m_selectedCompositor = NoCompositing;
+ 
+     State m_state = State::Off;
+     std::unique_ptr<WorkspaceScene> m_scene;
+     std::unique_ptr<RenderBackend> m_backend;
++    std::unique_ptr<RenderBackend> m_backend2;
+     std::unordered_map<RenderLoop *, std::unique_ptr<SceneView>> m_primaryViews;
+     std::unordered_map<RenderLoop *, std::unordered_map<OutputLayer *, std::unique_ptr<ItemView>>> m_overlayViews;
+     std::unordered_set<RenderLoop *> m_brokenCursors;
+diff --git a/src/main.cpp b/src/main.cpp
+index 11df7a7b7a..1c305496da 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -509,7 +509,7 @@ void Application::setProcessStartupEnvironment(const QProcessEnvironment &enviro
+ 
+ void Application::setOutputBackend(std::unique_ptr<OutputBackend> &&backend)
+ {
+-    Q_ASSERT(!m_outputBackend);
++    m_outputBackend2 = std::move(m_outputBackend);
+     m_outputBackend = std::move(backend);
+ }
+ 
+diff --git a/src/main.h b/src/main.h
+index ea556beec3..5d93616040 100644
+--- a/src/main.h
++++ b/src/main.h
+@@ -199,6 +199,10 @@ public:
+     {
+         return m_outputBackend.get();
+     }
++    OutputBackend *outputBackend2() const
++    {
++        return m_outputBackend2.get();
++    }
+     void setOutputBackend(std::unique_ptr<OutputBackend> &&backend);
+ 
+     Session *session() const
+@@ -345,6 +349,7 @@ private:
+ #endif
+     std::unique_ptr<Session> m_session;
+     std::unique_ptr<OutputBackend> m_outputBackend;
++    std::unique_ptr<OutputBackend> m_outputBackend2;
+     bool m_terminating = false;
+     qreal m_xwaylandScale = 1;
+     QProcessEnvironment m_processEnvironment;
+diff --git a/src/main_wayland.cpp b/src/main_wayland.cpp
+index d349d03745..836b3d71c9 100644
+--- a/src/main_wayland.cpp
++++ b/src/main_wayland.cpp
+@@ -54,6 +54,9 @@
+ #include <iomanip>
+ #include <iostream>
+ 
++#include "backends/drm/drm_abstract_output.h"
++#include "backends/wayland/wayland_qpainter_backend.h"
++
+ Q_IMPORT_PLUGIN(KWinIntegrationPlugin)
+ #if KWIN_BUILD_GLOBALSHORTCUTS
+ Q_IMPORT_PLUGIN(KGlobalAccelImpl)
+@@ -128,18 +131,29 @@ ApplicationWayland::~ApplicationWayland()
+     delete WaylandServer::self();
+ }
+ 
++static KWin::Wayland::WaylandBackend staticwayland = KWin::Wayland::WaylandBackend(KWin::Wayland::WaylandBackendOptions{
++    .socketName = "wayland-0",
++    .outputCount = 1,
++    .outputScale = 1,
++    .outputSize = QSize(256, 256),
++});
++static KWin::DrmBackend staticdrm = KWin::DrmBackend(KWin::Session::create(KWin::Session::Type::Noop).get());
++
+ void ApplicationWayland::performStartup()
+ {
+     createOptions();
+ 
+-    if (!outputBackend()->initialize()) {
+-        std::exit(1);
+-    }
++    staticwayland.initialize();
++    staticdrm.setSession(this->session());
++    staticdrm.initialize();
++    this->setOutputBackend(std::unique_ptr<KWin::Wayland::WaylandBackend>(&staticwayland));
+ 
+     createInput();
+     createInputMethod();
+     createTabletModeManager();
+ 
++    this->setOutputBackend(std::unique_ptr<KWin::DrmBackend>(&staticdrm));
++
+     auto compositor = Compositor::create();
+     compositor->createRenderer();
+     createWorkspace();
