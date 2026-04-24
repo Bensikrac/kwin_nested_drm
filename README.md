@@ -17,6 +17,7 @@
 - This is a hacky patch, it works but shutdown is not clean due to C++ and pointer shenanigans. Do not worry, the OS is the ultimate garbage collector in this case.
 - Screen recording obviously doesn't work, use gpu-screen-recorder and a fifo to stream to OBS or something, ffmpeg with kmsgrab does not work yet, since one color scheme is not implemented currently
 - Use kscreen-doctor to change display settings, settings before undbind should be used though, do not forget WAYLAND_DISPLAY=wayland-1
+- To record with OBS hack it together with https://github.com/Bensikrac/kmsgrab-rawvideo, this just pulls the framebuffer to a RGBA video stream
 
 # Usage
 ## Building
