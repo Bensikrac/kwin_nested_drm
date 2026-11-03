@@ -1,0 +1,409 @@
+diff --git a/src/backends/drm/drm_backend.cpp b/src/backends/drm/drm_backend.cpp
+index 896c260f0d..0fbfae9ab0 100644
+--- a/src/backends/drm/drm_backend.cpp
++++ b/src/backends/drm/drm_backend.cpp
+@@ -36,6 +36,7 @@
+ // system
+ #include <algorithm>
+ #include <cerrno>
++#include <fcntl.h>
+ #include <ranges>
+ #include <sys/stat.h>
+ #include <thread>
+@@ -73,13 +74,25 @@ public:
+         m_fd = *fd;
+     }
+ 
++    // Takes ownership of a file descriptor that was opened outside of the session,
++    // e.g. by nested setups which bypass the session's openRestricted().
++    explicit DrmAuthHandle(int fd)
++        : m_session(nullptr)
++        , m_fd(fd)
++    {
++    }
++
+     DrmAuthHandle(const DrmAuthHandle &) = delete;
+     DrmAuthHandle &operator=(const DrmAuthHandle &) = delete;
+ 
+     ~DrmAuthHandle()
+     {
+         if (m_fd != -1) {
+-            m_session->closeRestricted(m_fd);
++            if (m_session) {
++                m_session->closeRestricted(m_fd);
++            } else {
++                ::close(m_fd);
++            }
+         }
+     }
+ 
+@@ -234,13 +247,13 @@ void DrmBackend::handleUdevEvent()
+ 
+ DrmGpu *DrmBackend::addGpu(const QString &fileName)
+ {
+-    auto authHandle = m_gpuAuthHandles.value(fileName);
+-    if (!authHandle) {
+-        authHandle = std::make_shared<DrmAuthHandle>(m_session, fileName);
+-    }
+-    if (authHandle->fd() == -1) {
++    // Nested setups bypass the session and open the device node directly.
++    const int fd = ::open(fileName.toStdString().c_str(), O_RDONLY | O_CLOEXEC);
++    if (fd < 0) {
++        qCWarning(KWIN_DRM) << "failed to open drm device at" << fileName;
+         return nullptr;
+     }
++    auto authHandle = std::make_shared<DrmAuthHandle>(fd);
+ 
+     if (!drmIsKMS(authHandle->fd())) {
+         qCDebug(KWIN_DRM) << "Skipping KMS incapable drm device node at" << fileName;
+diff --git a/src/backends/drm/drm_backend.h b/src/backends/drm/drm_backend.h
+index 13e99ca767..e52c558262 100644
+--- a/src/backends/drm/drm_backend.h
++++ b/src/backends/drm/drm_backend.h
+@@ -47,6 +47,11 @@ public:
+     QList<BackendOutput *> outputs() const override;
+     Session *session() const override;
+ 
++    void setSession(KWin::Session *sess)
++    {
++        m_session = sess;
++    }
++
+     QList<CompositingType> supportedCompositors() const override;
+ 
+     QString supportInformation() const override;
+diff --git a/src/backends/wayland/wayland_backend.cpp b/src/backends/wayland/wayland_backend.cpp
+index f43f03d918..b688ea76ca 100644
+--- a/src/backends/wayland/wayland_backend.cpp
++++ b/src/backends/wayland/wayland_backend.cpp
+@@ -66,9 +66,8 @@ WaylandInputDevice::WaylandInputDevice(KWayland::Client::Keyboard *keyboard, Way
+         KeyboardKeyState state;
+         switch (nativeState) {
+         case Keyboard::KeyState::Pressed:
+-            if (key == KEY_RIGHTCTRL) {
+-                m_seat->backend()->togglePointerLock();
+-            }
++            // Always toggle (turn on) pointer lock
++            m_seat->backend()->togglePointerLock();
+             state = KeyboardKeyState::Pressed;
+             m_pressedKeys.insert(key);
+             break;
+@@ -188,8 +187,19 @@ WaylandInputDevice::WaylandInputDevice(KWayland::Client::RelativePointer *relati
+     : m_seat(seat)
+     , m_relativePointer(relativePointer)
+ {
++    static double pointbufferx = 0;
++    static double pointbuffery = 0;
++    // removed pointer accel here, to make games not change sens based on raw input (ATTENTION: WINE/Proton DOES ONLY int-value ptr movements, therefore the smoothing shenanigans)
+     connect(relativePointer, &RelativePointer::relativeMotion, this, [this](const QSizeF &delta, const QSizeF &deltaNonAccelerated, quint64 timestamp) {
+-        Q_EMIT pointerMotion(sizeToPoint(delta), sizeToPoint(deltaNonAccelerated), std::chrono::microseconds(timestamp), this);
++        double scaledx = delta.width();
++        double scaledy = delta.height();
++        pointbufferx += scaledx - static_cast<int>(scaledx);
++        pointbuffery += scaledy - static_cast<int>(scaledy);
++
++        Q_EMIT pointerMotion(sizeToPoint(delta), sizeToPoint(QSizeF(static_cast<int>(scaledx) + static_cast<int>(pointbufferx), static_cast<int>(scaledy) + static_cast<int>(pointbuffery))), std::chrono::microseconds(timestamp), this);
++
++        pointbufferx -= static_cast<int>(pointbufferx);
++        pointbuffery -= static_cast<int>(pointbuffery);
+     });
+ }
+ 
+@@ -538,8 +548,12 @@ std::unique_ptr<EglBackend> WaylandBackend::createOpenGLBackend(RenderDevice *de
+ 
+ WaylandOutput *WaylandBackend::findOutput(KWayland::Client::Surface *nativeSurface) const
+ {
+-    for (WaylandOutput *output : m_outputs) {
+-        const auto layers = Compositor::self()->backend()->compatibleOutputLayers(output);
++    RenderBackend *renderBackend = Compositor::self() ? Compositor::self()->backend2() : nullptr;
++    if (!renderBackend) {
++        return nullptr;
++    }
++    for (WaylandOutput *output : std::as_const(m_outputs)) {
++        const auto layers = renderBackend->compatibleOutputLayers(output);
+         const bool isALayer = std::ranges::any_of(layers, [nativeSurface](OutputLayer *layer) {
+             if (layer->type() == OutputLayerType::CursorOnly) {
+                 return false;
+@@ -558,8 +572,12 @@ WaylandOutput *WaylandBackend::findOutput(KWayland::Client::Surface *nativeSurfa
+ 
+ KWayland::Client::SubSurface *WaylandBackend::findSubSurface(KWayland::Client::Surface *nativeSurface) const
+ {
+-    for (WaylandOutput *output : m_outputs) {
+-        const auto layers = Compositor::self()->backend()->compatibleOutputLayers(output);
++    RenderBackend *renderBackend = Compositor::self() ? Compositor::self()->backend2() : nullptr;
++    if (!renderBackend) {
++        return nullptr;
++    }
++    for (WaylandOutput *output : std::as_const(m_outputs)) {
++        const auto layers = renderBackend->compatibleOutputLayers(output);
+         const auto it = std::ranges::find_if(layers, [nativeSurface](OutputLayer *layer) {
+             // cursor-only layers are a different class
+             // and can't be a subsurface
+@@ -600,9 +618,9 @@ void WaylandBackend::togglePointerLock()
+     }
+ 
+     for (auto output : std::as_const(m_outputs)) {
+-        output->lockPointer(m_seat->pointerDevice()->nativePointer(), !m_pointerLockRequested);
++        output->lockPointer(m_seat->pointerDevice()->nativePointer(), true);
+     }
+-    m_pointerLockRequested = !m_pointerLockRequested;
++    // Always lock no unlock
+ }
+ 
+ QList<CompositingType> WaylandBackend::supportedCompositors() const
+diff --git a/src/backends/wayland/wayland_output.cpp b/src/backends/wayland/wayland_output.cpp
+index 1543058f10..eef4b9f43e 100644
+--- a/src/backends/wayland/wayland_output.cpp
++++ b/src/backends/wayland/wayland_output.cpp
+@@ -514,6 +514,10 @@ void WaylandOutput::lockPointer(Pointer *pointer, bool lock)
+         }
+         return;
+     }
++    if (m_pointerLock) {
++        // Already locked from autolock
++        return;
++    }
+ 
+     Q_ASSERT(!m_pointerLock);
+     m_pointerLock.reset(m_backend->display()->pointerConstraints()->lockPointer(surface(), pointer, nullptr, PointerConstraints::LifeTime::OneShot));
+@@ -523,7 +527,7 @@ void WaylandOutput::lockPointer(Pointer *pointer, bool lock)
+     }
+     connect(m_pointerLock.get(), &LockedPointer::locked, this, [this]() {
+         m_hasPointerLock = true;
+-        inhibitShortcuts(true);
++        inhibitShortcuts(false);
+         updateWindowTitle();
+         Q_EMIT m_backend->pointerLockChanged(true);
+     });
+diff --git a/src/compositor.cpp b/src/compositor.cpp
+index 658d550818..8d7bddbfe0 100644
+--- a/src/compositor.cpp
++++ b/src/compositor.cpp
+@@ -47,6 +47,10 @@
+ #include <ranges>
+ #include <sys/stat.h>
+ 
++#include "backends/drm/drm_output.h"
++#include "backends/wayland/wayland_backend.h"
++#include "backends/wayland/wayland_output.h"
++
+ namespace KWin
+ {
+ 
+@@ -339,6 +343,28 @@ void Compositor::start()
+     if (kwinApp()->isTerminating()) {
+         return;
+     }
++    // DIY QPAINTER-WAYLAND INITILIZER
++    // Since 6.8 there is no QPainter compositing backend anymore; create the
++    // Wayland output backend's EGL backend instead so that its outputs have
++    // layers and findOutput()/findSubSurface() keep working.
++    {
++        if (auto *waylandBackend = qobject_cast<KWin::Wayland::WaylandBackend *>(kwinApp()->outputBackend2())) {
++            if (RenderDevice *device = waylandBackend->renderDevice()) {
++                std::unique_ptr<EglBackend> backend(waylandBackend->createOpenGLBackend(device));
++                if (backend && backend->init()) {
++                    m_backend2 = std::move(backend);
++                    // The WaylandEglBackend just re-advertised the dmabuf tranches with its own
++                    // render device (the host session's GPU) as the main device. The main device
++                    // is what Xwayland and other clients follow when picking their DRM device,
++                    // so re-run the primary backend's update to make it the one that the
++                    // compositor actually renders with.
++                    if (auto *primary = qobject_cast<EglBackend *>(m_backend.get())) {
++                        primary->updateDmabufTranches();
++                    }
++                }
++            }
++        }
++    }
+     if (m_state != State::Off) {
+         return;
+     }
+@@ -382,6 +408,9 @@ void Compositor::start()
+     handleOutputsChanged();
+     connect(workspace(), &Workspace::outputsChanged, this, &Compositor::handleOutputsChanged);
+     connect(kwinApp()->outputBackend(), &OutputBackend::outputRemoved, this, &Compositor::removeOutput);
++    if (auto *backend2 = kwinApp()->outputBackend2(); backend2 && !backend2->outputs().isEmpty()) {
++        addOutput(nullptr, backend2->outputs()[0]);
++    }
+ 
+     m_state = State::On;
+ 
+@@ -1082,9 +1111,25 @@ void Compositor::handleOutputsChanged()
+         }
+     }
+ }
++void Compositor::drawonce_function(BackendOutput *output)
++{
++    QList<OutputLayer *> toUpdate;
++
++    auto renderLoop = output->renderLoop();
++    renderLoop->prepareNewFrame();
++    renderLoop->newFramePrepared();
++    auto frame = std::make_shared<OutputFrame>(renderLoop, std::chrono::nanoseconds(1'000'000'000'000 / 60));
++    if (auto result = output->present(toUpdate, frame); !result) {
++        qCWarning(KWIN_CORE) << "Failed to present on output:" << int(result.error().code) << result.error().message;
++    }
++}
+ 
+ void Compositor::addOutput(LogicalOutput *logicalOutput, BackendOutput *backendOutput)
+ {
++    if (!dynamic_cast<KWin::DrmOutput *>(backendOutput)) {
++        drawonce_function(backendOutput);
++        return;
++    }
+     if (backendOutput->isPlaceholder()) {
+         return;
+     }
+diff --git a/src/compositor.h b/src/compositor.h
+index ed863723b9..ee5c1036d8 100644
+--- a/src/compositor.h
++++ b/src/compositor.h
+@@ -73,7 +73,10 @@ public:
+ 
+     RenderBackend *backend() const;
+     RenderDevice *primaryDevice() const;
+-
++    RenderBackend *backend2() const
++    {
++        return m_backend2.get();
++    }
+     void createRenderer();
+ 
+ Q_SIGNALS:
+@@ -120,10 +123,13 @@ protected:
+                                                                                           const std::shared_ptr<OutputFrame> &frame,
+                                                                                           std::unordered_set<OutputLayer *> &toUpdate);
+ 
++    void drawonce_function(BackendOutput *output);
++
+     CompositingType m_selectedCompositor = NoCompositing;
+ 
+     State m_state = State::Off;
+     std::unique_ptr<RenderBackend> m_backend;
++    std::unique_ptr<RenderBackend> m_backend2;
+     std::unordered_map<RenderLoop *, std::unique_ptr<SceneView>> m_primaryViews;
+     std::unordered_map<RenderLoop *, std::unordered_map<OutputLayer *, std::unique_ptr<ItemView>>> m_overlayViews;
+     std::unordered_map<RenderLoop *, std::unordered_map<OutputLayer *, std::unique_ptr<QTimer>>> m_overlayTimers;
+diff --git a/src/main.cpp b/src/main.cpp
+index 106b9e09fe..13a9e2667f 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -463,7 +463,7 @@ void Application::setProcessStartupEnvironment(const QProcessEnvironment &enviro
+ 
+ void Application::setOutputBackend(std::unique_ptr<OutputBackend> &&backend)
+ {
+-    Q_ASSERT(!m_outputBackend);
++    m_outputBackend2 = std::move(m_outputBackend);
+     m_outputBackend = std::move(backend);
+ }
+ 
+diff --git a/src/main.h b/src/main.h
+index 2bead4ae0d..54b5399d92 100644
+--- a/src/main.h
++++ b/src/main.h
+@@ -190,6 +190,10 @@ public:
+     {
+         return m_outputBackend.get();
+     }
++    OutputBackend *outputBackend2() const
++    {
++        return m_outputBackend2.get();
++    }
+     void setOutputBackend(std::unique_ptr<OutputBackend> &&backend);
+ 
+     Session *session() const
+@@ -336,6 +340,7 @@ private:
+ #endif
+     std::unique_ptr<Session> m_session;
+     std::unique_ptr<OutputBackend> m_outputBackend;
++    std::unique_ptr<OutputBackend> m_outputBackend2;
+     bool m_terminating = false;
+     std::optional<qreal> m_xwaylandScale;
+     QProcessEnvironment m_processEnvironment;
+diff --git a/src/main_wayland.cpp b/src/main_wayland.cpp
+index 686847ea3f..6c727a0645 100644
+--- a/src/main_wayland.cpp
++++ b/src/main_wayland.cpp
+@@ -138,20 +138,45 @@ ApplicationWayland::~ApplicationWayland()
+     delete WaylandServer::self();
+ }
+ 
++// Socket of the host compositor, captured during command line parsing in main()
++// (--wayland-display or WAYLAND_DISPLAY), used by the nested input-capture backend.
++static QString s_nestedHostSocketName = QStringLiteral("wayland-0");
++
++// Nested backends. Created in performStartup() as heap objects so that ownership can
++// be handed over to Application::setOutputBackend() without deleting static objects.
++static KWin::Wayland::WaylandBackend *nestedWaylandBackend = nullptr;
++static KWin::DrmBackend *nestedDrmBackend = nullptr;
++
+ void ApplicationWayland::performStartup()
+ {
+     createOptions();
+ 
+     createGpuManager();
+-    if (!outputBackend()->initialize()) {
+-        std::exit(1);
+-    }
++
++    // Nested wayland output backend: creates a small window on the host compositor
++    // which grabs pointer and keyboard input (see WaylandInputDevice::togglePointerLock).
++    // NOTE: the stock output backend created in main() is discarded below and must not
++    // be initialized here; its failure must not abort the nested startup.
++    nestedWaylandBackend = new KWin::Wayland::WaylandBackend(KWin::Wayland::WaylandBackendOptions{
++        .socketName = s_nestedHostSocketName,
++        .outputCount = 1,
++        .outputScale = 1,
++        .outputSize = QSize(256, 256),
++    });
++    if (!nestedWaylandBackend->initialize()) {
++        qWarning() << "Failed to initialize the nested wayland backend, no input capture window will be available";
++    }
++    nestedDrmBackend = new KWin::DrmBackend(this->session());
++    nestedDrmBackend->initialize();
++    this->setOutputBackend(std::unique_ptr<KWin::Wayland::WaylandBackend>(nestedWaylandBackend));
+ 
+     createInput();
+     createInputMethod();
+     createTabletModeManager();
+     createA11yManager();
+ 
++    this->setOutputBackend(std::unique_ptr<KWin::DrmBackend>(nestedDrmBackend));
++
+     auto compositor = Compositor::create();
+     compositor->createRenderer();
+     createWorkspace();
+@@ -608,6 +633,7 @@ int main(int argc, char *argv[])
+         if (socketName.isEmpty()) {
+             socketName = qgetenv("WAYLAND_DISPLAY");
+         }
++        KWin::s_nestedHostSocketName = socketName;
+         a.setSession(KWin::Session::create(KWin::Session::Type::Noop));
+         a.setOutputBackend(std::make_unique<KWin::Wayland::WaylandBackend>(KWin::Wayland::WaylandBackendOptions{
+             .socketName = socketName,
+diff --git a/src/opengl/eglbackend.h b/src/opengl/eglbackend.h
+index 3a1085f07c..4d3dcbd4b1 100644
+--- a/src/opengl/eglbackend.h
++++ b/src/opengl/eglbackend.h
+@@ -50,13 +50,19 @@ public:
+ 
+     QList<LinuxDmaBufV1Feedback::Tranche> tranches() const;
+ 
++    // Rebuilds the dmabuf feedback tranches advertised to Wayland clients, with
++    // this backend's render device as the main device. Whenever more than one
++    // EGL backend exists, this must be run last by the backend that owns the
++    // primary presentation, because the "main device" is what Xwayland and
++    // other clients follow when picking their DRM device.
++    void updateDmabufTranches();
++
+ protected:
+     void cleanup();
+     bool initClientExtensions();
+     void initWayland();
+     bool hasClientExtension(const QByteArray &ext) const;
+     bool createContext();
+-    void updateDmabufTranches();
+ 
+     RenderDevice *m_renderDevice = nullptr;
+     std::shared_ptr<EglContext> m_context;
